@@ -1,0 +1,25 @@
+# Saída e logs gerados pelo script
+saida/
+entrada/
+
+# Assets de mídia (não versionar vídeos/imagens pesadas)
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+fundo.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini

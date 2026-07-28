@@ -1,0 +1,11 @@
+# Dependências Python — clonador_reels.py
+# Instalar com: pip install -r requirements.txt
+
+tqdm>=4.65.0
+rich>=13.0.0
+
+# ─── FFmpeg (obrigatório — instalar no sistema, não via pip) ──────────────────
+# Windows: https://ffmpeg.org/download.html → extrair → adicionar pasta /bin ao PATH
+#          Verificar: ffmpeg -version
+# Mac:     brew install ffmpeg
+# Linux:   sudo apt install ffmpeg
