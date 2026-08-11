@@ -6,24 +6,26 @@ Pipeline 100% FFmpeg. Sem MoviePy.
 """
 
 import argparse
+import csv
+import hashlib
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
-from tqdm import tqdm
 
 
 # ─── CONFIGURAÇÃO CENTRAL ─────────────────────────────────────────────────────
-# Ajuste todos os parâmetros aqui. Nenhum valor hardcoded no código abaixo.
 CONFIG = {
     # Canvas de saída (formato 9:16 para Instagram/TikTok)
     "canvas_width":  1080,
@@ -33,26 +35,46 @@ CONFIG = {
     "video_width":  800,       # largura do vídeo (px). Altura calculada proporcionalmente.
     "position_x":  "center",  # posição horizontal: "center" ou valor inteiro em px
     "position_y":  0.40,      # fração vertical do canvas (0.40 = 40% do topo)
-    # Safe zone Instagram: UI cobre os últimos ~250px inferiores (curtir/comentar)
-    # Safe zone TikTok:    UI cobre os últimos ~300px inferiores (descrição + botões)
+    # Safe zone Instagram: UI cobre os últimos ~250px inferiores
+    # Safe zone TikTok:    UI cobre os últimos ~300px inferiores
 
     # Qualidade de exportação
-    "output_fps":    30,       # FPS fixo de saída (converte se fonte for diferente)
-    "output_crf":    18,       # CRF libx264: 18=alta qualidade, 23=médio, 28=comprimido
-    "output_preset": "slow",   # Preset libx264: ultrafast/fast/medium/slow/veryslow
-    "audio_bitrate": "192k",   # Bitrate AAC
+    "output_fps":    30,
+    "output_crf":    18,       # 18=alta qualidade, 23=médio, 28=comprimido
+    "output_preset": "slow",   # ultrafast/fast/medium/slow/veryslow
+    "audio_bitrate": "192k",
 
-    # Técnicas anti-ban — valores aleatórios por vídeo dentro dos intervalos abaixo
-    "trim_start":        0.1,           # segundos removidos do início (elimina frame inicial duplicado)
-    "speed_range":       (1.02, 1.05),  # fator de aceleração — muda hash do arquivo
-    "brightness_range":  (0.01, 0.02),  # variação de brilho (escala FFmpeg eq: -1.0 a 1.0, neutro=0)
-    "saturation_range":  (-0.02, 0.02), # variação de saturação em torno de 1.0 (neutro FFmpeg eq)
-    "zoom_range":        (1.01, 1.03),  # fator de zoom leve aplicado antes de compor no fundo
-    "flip_chance":       0.5,           # probabilidade de flip horizontal (0.0 a 1.0)
+    # Fallback automático: se o encode falhar, tenta de novo com estes valores
+    "fallback_enabled": True,
+    "fallback_crf":     23,
+    "fallback_preset":  "medium",
+
+    # Paralelismo — quantos vídeos processar ao mesmo tempo.
+    # None = automático (metade dos cores, mínimo 1, máximo 4).
+    # Use 1 para processar um de cada vez (comportamento antigo).
+    "workers": None,
+
+    # Técnicas anti-ban — valores aleatórios por vídeo dentro dos intervalos
+    "trim_start":        0.1,
+    "speed_range":       (1.02, 1.05),
+    "brightness_range":  (0.01, 0.02),
+    "saturation_range":  (-0.02, 0.02),
+    "zoom_range":        (1.01, 1.03),
+    "flip_chance":       0.0,
+    # ATENÇÃO: flip_chance > 0 ESPELHA o vídeo — imagem e textos ficam VIRADOS.
+
+    # ─── Máscara de watermark / indicadores do app ───────────────────────────
+    # Cobre regiões do vídeo FONTE (ex: "1x"/"3x" de velocidade, logo do TikTok).
+    # Coordenadas em px, relativas ao vídeo ORIGINAL (antes do redimensionamento).
+    # Deixe a lista vazia para desativar.
+    # Exemplo: {"x": 20, "y": 40, "w": 90, "h": 50, "mode": "blur"}
+    #   mode: "blur" (borra) ou "box" (tampa com cor sólida)
+    "watermark_masks": [],
+    "mask_box_color":  "black",
 
     # Comportamento do script
-    "skip_existing": True,  # pular vídeos com estado "sucesso" salvo OU arquivo de saída existente
-    "min_duration":  3.0,   # duração mínima aceitável após trim (segundos)
+    "skip_existing": True,
+    "min_duration":  3.0,
 }
 
 # ─── PATHS ────────────────────────────────────────────────────────────────────
@@ -62,9 +84,13 @@ DIR_SAIDA   = DIR_BASE / "saida"
 DIR_LOGS    = DIR_SAIDA / "logs"
 FUNDO_PATH  = DIR_BASE / "fundo.png"
 LOG_FILE    = DIR_LOGS / "processamento.log"
-STATE_FILE  = DIR_SAIDA / "processados.json"  # persiste entre execuções
+STATE_FILE  = DIR_SAIDA / "processados.json"
+CSV_FILE    = DIR_SAIDA / "relatorio.csv"
 
 console = Console()
+
+# Locks para acesso concorrente ao estado e ao log
+_state_lock = threading.Lock()
 
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
@@ -94,26 +120,32 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def resolver_workers() -> int:
+    """Define quantos vídeos processar em paralelo."""
+    cfg = CONFIG.get("workers")
+    if isinstance(cfg, int) and cfg > 0:
+        return cfg
+    cores = os.cpu_count() or 2
+    return max(1, min(4, cores // 2))
+
+
 # ─── VALIDAÇÃO ────────────────────────────────────────────────────────────────
 
 def validar_ambiente(logger: logging.Logger) -> list[Path]:
     """
     Valida FFmpeg, fundo.png e pastas.
     Retorna lista de .mp4 em /entrada ordenada alfabeticamente.
-    Aborta com SystemExit em qualquer falha crítica.
     """
-    # FFmpeg e ffprobe no PATH
     for cmd in ["ffmpeg", "ffprobe"]:
         try:
             subprocess.run([cmd, "-version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
             logger.error(f"{cmd} não encontrado no PATH.")
-            logger.error("Windows: https://ffmpeg.org/download.html → extrair e adicionar pasta /bin ao PATH")
+            logger.error("Windows: https://ffmpeg.org/download.html → extrair e adicionar /bin ao PATH")
             logger.error("Mac:     brew install ffmpeg")
             logger.error("Linux:   sudo apt install ffmpeg")
             sys.exit(1)
 
-    # fundo.png existe
     if not FUNDO_PATH.exists():
         logger.error(f"fundo.png ausente: {FUNDO_PATH}")
         logger.error(
@@ -122,7 +154,6 @@ def validar_ambiente(logger: logging.Logger) -> list[Path]:
         )
         sys.exit(1)
 
-    # Dimensões exatas do fundo via ffprobe
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(FUNDO_PATH)],
         capture_output=True,
@@ -142,11 +173,9 @@ def validar_ambiente(logger: logging.Logger) -> list[Path]:
         )
         sys.exit(1)
 
-    # Criar pastas necessárias
     DIR_ENTRADA.mkdir(exist_ok=True)
     DIR_SAIDA.mkdir(exist_ok=True)
 
-    # Listar e ordenar vídeos — suffix.lower() pega .mp4 e .MP4 no Windows
     videos = sorted(
         [p for p in DIR_ENTRADA.iterdir() if p.suffix.lower() == ".mp4"],
         key=lambda p: p.name.lower(),
@@ -161,8 +190,8 @@ def validar_ambiente(logger: logging.Logger) -> list[Path]:
 
 # ─── FFPROBE ──────────────────────────────────────────────────────────────────
 
-def obter_duracao(path: Path) -> float:
-    """Retorna duração do vídeo em segundos via ffprobe."""
+def _probe(path: Path) -> dict:
+    """Executa ffprobe e retorna o JSON de format + streams."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "quiet",
@@ -174,27 +203,47 @@ def obter_duracao(path: Path) -> float:
         capture_output=True,
         text=True,
     )
-    data = json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
 
-    # format.duration é mais confiável; fallback para stream
+
+def obter_info(path: Path) -> dict:
+    """
+    Retorna {'duracao': float, 'audio': bool, 'width': int, 'height': int}.
+    Uma única chamada ao ffprobe em vez de várias.
+    """
+    data = _probe(path)
+
     duration = data.get("format", {}).get("duration")
-    if not duration:
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video" and "duration" in stream:
+    video_stream = None
+    tem_audio = False
+
+    for stream in data.get("streams", []):
+        tipo = stream.get("codec_type")
+        if tipo == "video" and video_stream is None:
+            video_stream = stream
+            if not duration and "duration" in stream:
                 duration = stream["duration"]
-                break
+        elif tipo == "audio":
+            tem_audio = True
+
     if not duration:
         raise ValueError(f"Não foi possível determinar duração de {path.name}")
-    return float(duration)
+
+    return {
+        "duracao": float(duration),
+        "audio":   tem_audio,
+        "width":   int(video_stream.get("width", 0)) if video_stream else 0,
+        "height":  int(video_stream.get("height", 0)) if video_stream else 0,
+    }
 
 
 # ─── ANTI-BAN ─────────────────────────────────────────────────────────────────
 
 def gerar_params_antiban(seed: int) -> dict:
-    """
-    Gera parâmetros de variação aleatórios para um vídeo.
-    Seed derivada do nome do arquivo: mesma seed = mesmos parâmetros (reproducível).
-    """
+    """Gera parâmetros de variação. Mesma seed = mesmos parâmetros (reproducível)."""
     rng = random.Random(seed)
     return {
         "seed":       seed,
@@ -207,180 +256,180 @@ def gerar_params_antiban(seed: int) -> dict:
     }
 
 
+# ─── MÁSCARA DE WATERMARK ─────────────────────────────────────────────────────
+
+def construir_filtros_mascara() -> list[str]:
+    """
+    Monta os filtros que cobrem watermarks/indicadores do vídeo fonte.
+    Aplicado ANTES do redimensionamento, em coordenadas do vídeo original.
+    """
+    filtros = []
+    for m in CONFIG.get("watermark_masks", []):
+        x, y = int(m["x"]), int(m["y"])
+        w, h = int(m["w"]), int(m["h"])
+        modo = m.get("mode", "blur")
+
+        if modo == "box":
+            cor = m.get("color", CONFIG["mask_box_color"])
+            filtros.append(f"drawbox=x={x}:y={y}:w={w}:h={h}:color={cor}:t=fill")
+        else:
+            # delogo interpola a região a partir das bordas — menos visível que uma caixa
+            filtros.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
+    return filtros
+
+
 # ─── CONSTRUÇÃO DOS FILTROS ───────────────────────────────────────────────────
 
-def construir_filtros(params: dict) -> tuple[str, str]:
+def construir_filtros(params: dict, com_audio: bool) -> tuple[str, str | None]:
     """
     Monta filter_complex e audio_filter para FFmpeg.
-    Aplica: speed, zoom, crop, brilho, saturação, flip opcional, overlay no fundo.
-    Retorna (filter_complex_str, audio_filter_str).
+    Ordem: máscara → speed → zoom/crop → eq → flip → overlay no fundo.
     """
     canvas_w   = CONFIG["canvas_width"]
     canvas_h   = CONFIG["canvas_height"]
     video_w    = CONFIG["video_width"]
     speed      = params["speed"]
     brightness = params["brightness"]
-    # eq filter: saturation neutro = 1.0; soma o delta configurado
     saturation = 1.0 + params["saturation"]
     zoom       = params["zoom"]
     flip       = params["flip"]
 
-    # Largura com zoom — garantir múltiplo de 2 (libx264 exige)
+    # Largura com zoom — múltiplo de 2 (exigência do libx264)
     zoomed_w = int(video_w * zoom)
     if zoomed_w % 2 != 0:
         zoomed_w += 1
 
-    # Cadeia de filtros de vídeo aplicados antes do overlay
-    video_filters = [
-        f"setpts=PTS/{speed}",                                        # aceleração temporal
-        f"scale={zoomed_w}:-2",                                       # redimensiona com zoom (altura automática par)
-        f"crop={video_w}:ih",                                         # recorta de volta à largura alvo → efeito zoom
-        f"eq=brightness={brightness}:saturation={saturation:.4f}",    # brilho e saturação
+    video_filters = []
+
+    # 1. Máscaras primeiro, em coordenadas do vídeo original
+    video_filters.extend(construir_filtros_mascara())
+
+    # 2. Transformações
+    video_filters += [
+        f"setpts=PTS/{speed}",
+        f"scale={zoomed_w}:-2",
+        f"crop={video_w}:ih",
+        f"eq=brightness={brightness}:saturation={saturation:.4f}",
     ]
     if flip:
-        video_filters.append("hflip")                                 # flip horizontal — muda hash radicalmente
+        video_filters.append("hflip")  # ESPELHA o conteúdo
 
-    # Posição X do overlay
     pos_x_cfg = CONFIG["position_x"]
     if pos_x_cfg == "center":
         overlay_x = f"({canvas_w}-overlay_w)/2"
     else:
         overlay_x = str(int(pos_x_cfg))
 
-    # Posição Y do overlay — safe zone configurada em position_y
     overlay_y = int(canvas_h * CONFIG["position_y"])
 
     filter_complex = (
-        f"[0:v]scale={canvas_w}:{canvas_h}[bg];"           # escala fundo ao canvas
-        f"[1:v]{','.join(video_filters)}[vid];"             # processa vídeo
-        f"[bg][vid]overlay={overlay_x}:{overlay_y}[out]"   # compõe overlay
+        f"[0:v]scale={canvas_w}:{canvas_h}[bg];"
+        f"[1:v]{','.join(video_filters)}[vid];"
+        f"[bg][vid]overlay={overlay_x}:{overlay_y}:shortest=1[out]"
     )
 
-    # atempo sincroniza áudio com a aceleração do vídeo (range válido: 0.5–2.0)
-    audio_filter = f"atempo={speed}"
+    # atempo sincroniza o áudio com a aceleração (range válido: 0.5–2.0)
+    audio_filter = f"atempo={speed}" if com_audio else None
 
     return filter_complex, audio_filter
 
 
-# ─── PROGRESSO FFmpeg ─────────────────────────────────────────────────────────
-
-def _monitorar_progresso(stdout_pipe, pbar: tqdm, duracao: float):
-    """
-    Thread auxiliar: lê output de progresso do FFmpeg (pipe:1) e atualiza tqdm.
-    FFmpeg reporta out_time_ms a cada stats_period segundos.
-    """
-    for line in stdout_pipe:
-        line = line.strip()
-        if line.startswith("out_time_ms="):
-            try:
-                ms = int(line.split("=", 1)[1])
-                if ms > 0:
-                    pbar.n = min(ms / 1_000_000, duracao)
-                    pbar.refresh()
-            except ValueError:
-                pass
-
-
 # ─── RENDERIZAÇÃO ─────────────────────────────────────────────────────────────
+
+def _montar_comando(
+    input_path: Path,
+    output_path: Path,
+    params: dict,
+    com_audio: bool,
+    crf: int,
+    preset: str,
+) -> list[str]:
+    """Monta a linha de comando completa do FFmpeg."""
+    filter_complex, audio_filter = construir_filtros(params, com_audio)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "error",
+        "-loop", "1",
+        "-i", str(FUNDO_PATH),          # input 0: fundo estático
+        "-ss", str(params["trim_start"]),
+        "-i", str(input_path),          # input 1: vídeo fonte
+        "-filter_complex", filter_complex,
+    ]
+
+    if audio_filter:
+        cmd += ["-filter:a", audio_filter]
+
+    cmd += ["-map", "[out]"]
+
+    if com_audio:
+        cmd += ["-map", "1:a"]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", preset,
+        "-pix_fmt", "yuv420p",
+        "-r", str(CONFIG["output_fps"]),
+    ]
+
+    if com_audio:
+        cmd += ["-c:a", "aac", "-b:a", CONFIG["audio_bitrate"]]
+
+    cmd += [
+        "-shortest",                 # termina quando o vídeo fonte acabar (o fundo é infinito)
+        "-map_metadata", "-1",
+        "-fflags", "+bitexact",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    return cmd
+
 
 def renderizar_video(
     input_path: Path,
     output_path: Path,
     params: dict,
-    duracao_original: float,
+    com_audio: bool,
     logger: logging.Logger,
-) -> bool:
+) -> tuple[bool, str]:
     """
-    Executa FFmpeg single-pass: fundo.png + vídeo fonte → saída com anti-ban.
-    Sem arquivos temporários. Sem MoviePy.
-    Retorna True se sucesso, False se erro.
+    Executa FFmpeg. Em caso de falha, tenta uma vez com preset/CRF mais leves.
+    Retorna (sucesso, qualidade_usada).
     """
-    filter_complex, audio_filter = construir_filtros(params)
-    trim_start  = params["trim_start"]
-    duracao_saida = (duracao_original - trim_start) / params["speed"]
+    tentativas = [(CONFIG["output_crf"], CONFIG["output_preset"])]
+    if CONFIG["fallback_enabled"]:
+        tentativas.append((CONFIG["fallback_crf"], CONFIG["fallback_preset"]))
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-progress", "pipe:1",       # progresso estruturado para stdout (lido pela thread)
-        "-stats_period", "0.5",      # frequência de atualização de progresso
-        "-loop", "1",                # fundo.png em loop (imagem estática)
-        "-i", str(FUNDO_PATH),       # input 0: fundo
-        "-ss", str(trim_start),      # trim início antes do input (fast seek)
-        "-i", str(input_path),       # input 1: vídeo fonte
-        "-t", str(duracao_saida),    # duração total de saída
-        "-filter_complex", filter_complex,
-        "-filter:a", audio_filter,
-        "-map", "[out]",             # stream de vídeo composto
-        "-map", "1:a?",              # áudio original (opcional — evita erro em vídeo mudo)
-        "-c:v", "libx264",
-        "-crf", str(CONFIG["output_crf"]),
-        "-preset", CONFIG["output_preset"],
-        "-pix_fmt", "yuv420p",       # compatibilidade mobile obrigatória
-        "-r", str(CONFIG["output_fps"]),
-        "-c:a", "aac",
-        "-b:a", CONFIG["audio_bitrate"],
-        "-map_metadata", "-1",       # strip todos os metadados do container
-        "-fflags", "+bitexact",      # remove fingerprint do encoder
-        "-movflags", "+faststart",   # moov atom no início (streaming mobile/web)
-        str(output_path),
-    ]
+    ultimo_erro = ""
 
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    for idx, (crf, preset) in enumerate(tentativas):
+        cmd = _montar_comando(input_path, output_path, params, com_audio, crf, preset)
 
-        stderr_lines: list[str] = []
-
-        def _ler_stderr(pipe):
-            for line in pipe:
-                stderr_lines.append(line)
-
-        with tqdm(
-            total=duracao_saida,
-            desc="  Renderizando",
-            unit="s",
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}]",
-            ncols=72,
-        ) as pbar:
-            # Duas threads separadas: stdout (progresso) e stderr (erros)
-            # process.communicate() não pode ser usado aqui pois conflita com leitura de stdout
-            t_progress = threading.Thread(
-                target=_monitorar_progresso,
-                args=(process.stdout, pbar, duracao_saida),
-                daemon=True,
+        if idx > 0:
+            logger.warning(
+                f"[yellow]RETRY[/yellow] {input_path.name} — "
+                f"tentando com crf={crf} preset={preset}"
             )
-            t_stderr = threading.Thread(
-                target=_ler_stderr,
-                args=(process.stderr,),
-                daemon=True,
-            )
-            t_progress.start()
-            t_stderr.start()
-            process.wait()
-            t_progress.join(timeout=2)
-            t_stderr.join(timeout=5)
-            pbar.n = pbar.total
-            pbar.refresh()
 
-        stderr = "".join(stderr_lines)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as exc:
+            ultimo_erro = str(exc)
+            continue
 
-        if process.returncode != 0:
-            linhas_erro = [l for l in stderr.splitlines() if "error" in l.lower()]
-            msg = linhas_erro[-1] if linhas_erro else (
-                stderr.splitlines()[-1] if stderr else "erro desconhecido"
-            )
-            logger.error(f"FFmpeg falhou (código {process.returncode}): {msg}")
-            return False
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return True, f"crf{crf}/{preset}"
 
-        return True
+        stderr = proc.stderr or ""
+        linhas = [l for l in stderr.splitlines() if l.strip()]
+        ultimo_erro = linhas[-1] if linhas else f"código {proc.returncode}"
 
-    except Exception as exc:
-        logger.error(f"Exceção ao executar FFmpeg: {exc}")
-        return False
+        if output_path.exists():
+            output_path.unlink()
+
+    logger.error(f"FFmpeg falhou em {input_path.name}: {ultimo_erro}")
+    return False, ""
 
 
 # ─── ESTADO PERSISTIDO ────────────────────────────────────────────────────────
@@ -396,11 +445,45 @@ def carregar_estado() -> dict:
 
 
 def salvar_estado(estado: dict):
-    """Persiste histórico de processamento em JSON após cada vídeo."""
-    STATE_FILE.write_text(
-        json.dumps(estado, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """Persiste histórico em JSON. Thread-safe."""
+    with _state_lock:
+        STATE_FILE.write_text(
+            json.dumps(estado, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def exportar_csv(estado: dict, logger: logging.Logger):
+    """Gera relatorio.csv com o mapeamento entrada → saída e os parâmetros usados."""
+    colunas = [
+        "arquivo_origem", "arquivo_saida", "status", "tempo_s", "tamanho_mb",
+        "qualidade", "speed", "zoom", "brightness", "saturation", "flip",
+        "seed", "timestamp",
+    ]
+    try:
+        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=colunas)
+            writer.writeheader()
+            for nome, dados in sorted(estado.items()):
+                p = dados.get("params", {})
+                writer.writerow({
+                    "arquivo_origem": nome,
+                    "arquivo_saida":  dados.get("output", ""),
+                    "status":         dados.get("status", ""),
+                    "tempo_s":        dados.get("tempo_s", ""),
+                    "tamanho_mb":     dados.get("tamanho_mb", ""),
+                    "qualidade":      dados.get("qualidade", ""),
+                    "speed":          p.get("speed", ""),
+                    "zoom":           p.get("zoom", ""),
+                    "brightness":     p.get("brightness", ""),
+                    "saturation":     p.get("saturation", ""),
+                    "flip":           p.get("flip", ""),
+                    "seed":           p.get("seed", ""),
+                    "timestamp":      dados.get("timestamp", ""),
+                })
+        logger.info(f"Relatório CSV salvo em {CSV_FILE.name}")
+    except OSError as exc:
+        logger.warning(f"Não foi possível gravar o CSV: {exc}")
 
 
 # ─── ORQUESTRADOR ─────────────────────────────────────────────────────────────
@@ -414,156 +497,101 @@ def processar_video(
     dry_run: bool = False,
 ) -> str:
     """
-    Orquestra processamento completo de um vídeo:
-    validação de duração → params anti-ban → renderização → atualização de estado.
+    Orquestra o processamento de um vídeo.
     Retorna: "sucesso" | "pulado" | "erro"
     """
     nome = video_path.name
     output_path = DIR_SAIDA / f"{video_path.stem}_edited.mp4"
+    prefixo = f"[{index}/{total}] {nome}"
 
-    console.rule(f"[bold cyan]{index}/{total}: {nome}[/bold cyan]")
-
-    # Skip por estado persistido (processamento anterior bem-sucedido)
+    # Skip por estado persistido
     if CONFIG["skip_existing"] and estado.get(nome, {}).get("status") == "sucesso":
-        logger.info(f"[yellow]PULADO[/yellow] {nome} — já processado (estado salvo)")
+        logger.info(f"[yellow]PULADO[/yellow] {prefixo} — já processado")
         return "pulado"
 
-    # Skip por arquivo existente sem registro de estado
+    # Skip por arquivo de saída existente
     if CONFIG["skip_existing"] and output_path.exists() and nome not in estado:
-        logger.info(f"[yellow]PULADO[/yellow] {nome} — arquivo de saída já existe")
+        logger.info(f"[yellow]PULADO[/yellow] {prefixo} — saída já existe")
         return "pulado"
 
-    # Obter duração
+    # Informações do vídeo (duração, áudio, resolução) numa só chamada
     try:
-        duracao = obter_duracao(video_path)
+        info = obter_info(video_path)
     except ValueError as exc:
-        logger.error(f"[red]ERRO[/red] {nome} — {exc}")
+        logger.error(f"[red]ERRO[/red] {prefixo} — {exc}")
         return "erro"
 
-    # Validar duração mínima após trim
+    duracao = info["duracao"]
     duracao_util = duracao - CONFIG["trim_start"]
     if duracao_util < CONFIG["min_duration"]:
         logger.warning(
-            f"[yellow]PULADO[/yellow] {nome} — duração útil {duracao_util:.1f}s "
-            f"< mínimo configurado {CONFIG['min_duration']}s"
+            f"[yellow]PULADO[/yellow] {prefixo} — duração útil {duracao_util:.1f}s "
+            f"< mínimo {CONFIG['min_duration']}s"
         )
         return "pulado"
 
-    # Parâmetros anti-ban (seed derivada do nome = mesma seed em reruns)
-    seed = abs(hash(nome)) % (2 ** 31)
+    # Seed estável via MD5 (hash() do Python é randomizado entre execuções)
+    seed = int(hashlib.md5(nome.encode("utf-8")).hexdigest()[:8], 16)
     params = gerar_params_antiban(seed)
 
-    flip_str = "SIM" if params["flip"] else "NÃO"
+    duracao_final = duracao_util / params["speed"]
+    audio_str = "com áudio" if info["audio"] else "MUDO"
+
     logger.info(
-        f"Anti-ban — seed={seed} | speed={params['speed']}x | zoom={params['zoom']}x | "
-        f"flip={flip_str} | brightness={params['brightness']:+.4f} | saturation={params['saturation']:+.4f}"
+        f"[cyan]{prefixo}[/cyan] — {info['width']}x{info['height']} | "
+        f"{duracao:.1f}s → {duracao_final:.1f}s | {audio_str}"
+    )
+    logger.debug(
+        f"{nome} anti-ban: seed={seed} speed={params['speed']}x zoom={params['zoom']}x "
+        f"flip={params['flip']} brightness={params['brightness']:+.4f} "
+        f"saturation={params['saturation']:+.4f}"
     )
 
+    if params["flip"]:
+        logger.warning(
+            f"[yellow]AVISO[/yellow] {nome} — flip ativo: o conteúdo será ESPELHADO. "
+            f"Defina flip_chance=0.0 no CONFIG para desativar."
+        )
+
     if dry_run:
-        logger.info(f"[dim]DRY-RUN: renderização de {nome} não executada[/dim]")
         return "pulado"
 
-    # Renderizar
     t_inicio = time.time()
-    sucesso = renderizar_video(video_path, output_path, params, duracao, logger)
+    sucesso, qualidade = renderizar_video(
+        video_path, output_path, params, info["audio"], logger
+    )
     tempo = round(time.time() - t_inicio, 1)
 
     if sucesso:
-        logger.info(f"[green]OK[/green] {nome} → {output_path.name} ({tempo}s)")
-        estado[nome] = {
-            "status":    "sucesso",
-            "output":    output_path.name,
-            "tempo_s":   tempo,
-            "params":    params,
-            "timestamp": datetime.now().isoformat(),
+        tamanho_mb = round(output_path.stat().st_size / (1024 * 1024), 2)
+        logger.info(
+            f"[green]OK[/green] {prefixo} → {output_path.name} "
+            f"({tempo}s, {tamanho_mb}MB, {qualidade})"
+        )
+        registro = {
+            "status":     "sucesso",
+            "output":     output_path.name,
+            "tempo_s":    tempo,
+            "tamanho_mb": tamanho_mb,
+            "qualidade":  qualidade,
+            "params":     params,
+            "timestamp":  datetime.now().isoformat(),
         }
     else:
-        logger.error(f"[red]ERRO[/red] {nome} — falhou após {tempo}s")
-        estado[nome] = {
+        logger.error(f"[red]ERRO[/red] {prefixo} — falhou após {tempo}s")
+        registro = {
             "status":    "erro",
             "timestamp": datetime.now().isoformat(),
+            "params":    params,
         }
-        # Remover saída parcial ou corrompida
         if output_path.exists():
             output_path.unlink()
 
+    with _state_lock:
+        estado[nome] = registro
     salvar_estado(estado)
+
     return "sucesso" if sucesso else "erro"
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-
-def main():
-    """Ponto de entrada. Loop principal com try/except individual por vídeo."""
-    parser = argparse.ArgumentParser(
-        description="Clonador de Reels — edição em lote 9:16 (Instagram/TikTok)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Lista vídeos e parâmetros anti-ban sem renderizar nada",
-    )
-    parser.add_argument(
-        "--reprocess",
-        metavar="ARQUIVO",
-        help="Força reprocessar um arquivo específico ignorando skip_existing",
-    )
-    args = parser.parse_args()
-
-    logger = setup_logging()
-
-    console.rule("[bold magenta]Clonador de Reels — Dark Page[/bold magenta]")
-    logger.info(f"Sessão iniciada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    if args.dry_run:
-        logger.info("[yellow]DRY-RUN ativo — nenhum vídeo será renderizado[/yellow]")
-
-    videos = validar_ambiente(logger)
-    estado = carregar_estado()
-
-    # --reprocess: isola um arquivo e limpa estado anterior dele
-    if args.reprocess:
-        alvo = Path(args.reprocess).name
-        videos = [v for v in videos if v.name == alvo]
-        if not videos:
-            logger.error(f"'{alvo}' não encontrado em /entrada.")
-            sys.exit(1)
-        estado.pop(alvo, None)
-        salvar_estado(estado)
-        logger.info(f"--reprocess: forçando '{alvo}' (estado anterior removido)")
-
-    total = len(videos)
-    contadores = {"sucesso": 0, "pulado": 0, "erro": 0}
-
-    for i, video_path in enumerate(videos, start=1):
-        try:
-            resultado = processar_video(
-                video_path=video_path,
-                index=i,
-                total=total,
-                estado=estado,
-                logger=logger,
-                dry_run=args.dry_run,
-            )
-            contadores[resultado] += 1
-        except Exception as exc:
-            logger.exception(f"Erro inesperado em {video_path.name}: {exc}")
-            contadores["erro"] += 1
-
-    # Resumo final
-    console.rule("[bold]Concluído[/bold]")
-    tabela = Table(show_header=False, box=None, padding=(0, 2))
-    tabela.add_row("[green]Sucesso[/green]",   f"[green]{contadores['sucesso']}[/green]")
-    tabela.add_row("[yellow]Pulados[/yellow]",  f"[yellow]{contadores['pulado']}[/yellow]")
-    tabela.add_row("[red]Erros[/red]",          f"[red]{contadores['erro']}[/red]")
-    tabela.add_row("Total",                     str(total))
-    console.print(tabela)
-
-    logger.info(
-        f"sucesso={contadores['sucesso']} | "
-        f"pulados={contadores['pulado']} | "
-        f"erros={contadores['erro']}"
-    )
-
-
-if __name__ == "__main__":
-    main()
+# ─── MAIN ──────────────────────────────────────────────────
