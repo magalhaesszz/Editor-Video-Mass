@@ -69,7 +69,13 @@ CONFIG = {
     # Deixe a lista vazia para desativar.
     # Exemplo: {"x": 20, "y": 40, "w": 90, "h": 50, "mode": "blur"}
     #   mode: "blur" (borra) ou "box" (tampa com cor sólida)
-    "watermark_masks": [],
+    # Máscara do indicador de velocidade do TikTok ("1.8x", "1x", "3x" etc.)
+    # Posição central-superior do vídeo. Ajuste x/y/w/h se o seu vídeo for diferente.
+    # mode "blur" usa delogo (interpola das bordas — quase invisível).
+    # Para desativar, deixe a lista vazia: []
+    "watermark_masks": [
+        {"x": "center", "y": 0.08, "w": 130, "h": 80, "mode": "blur"},
+    ],
     "mask_box_color":  "black",
 
     # Comportamento do script
@@ -258,32 +264,47 @@ def gerar_params_antiban(seed: int) -> dict:
 
 # ─── MÁSCARA DE WATERMARK ─────────────────────────────────────────────────────
 
-def construir_filtros_mascara() -> list[str]:
+def construir_filtros_mascara(src_w: int, src_h: int) -> list[str]:
     """
     Monta os filtros que cobrem watermarks/indicadores do vídeo fonte.
     Aplicado ANTES do redimensionamento, em coordenadas do vídeo original.
+    x pode ser int (px) ou "center" (centraliza w na largura do vídeo).
+    y pode ser int (px) ou float 0–1 (fração da altura do vídeo).
     """
     filtros = []
     for m in CONFIG.get("watermark_masks", []):
-        x, y = int(m["x"]), int(m["y"])
         w, h = int(m["w"]), int(m["h"])
-        modo = m.get("mode", "blur")
 
+        # x: "center" ou px absoluto
+        x_cfg = m["x"]
+        if x_cfg == "center":
+            x = max(0, (src_w - w) // 2)
+        else:
+            x = int(x_cfg)
+
+        # y: fração 0–1 ou px absoluto
+        y_cfg = m["y"]
+        if isinstance(y_cfg, float) and 0.0 <= y_cfg <= 1.0:
+            y = int(src_h * y_cfg)
+        else:
+            y = int(y_cfg)
+
+        modo = m.get("mode", "blur")
         if modo == "box":
             cor = m.get("color", CONFIG["mask_box_color"])
             filtros.append(f"drawbox=x={x}:y={y}:w={w}:h={h}:color={cor}:t=fill")
         else:
-            # delogo interpola a região a partir das bordas — menos visível que uma caixa
             filtros.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
     return filtros
 
 
 # ─── CONSTRUÇÃO DOS FILTROS ───────────────────────────────────────────────────
 
-def construir_filtros(params: dict, com_audio: bool) -> tuple[str, str | None]:
+def construir_filtros(params: dict, com_audio: bool, src_w: int = 0, src_h: int = 0) -> tuple[str, str | None]:
     """
     Monta filter_complex e audio_filter para FFmpeg.
     Ordem: máscara → speed → zoom/crop → eq → flip → overlay no fundo.
+    src_w/src_h = dimensões do vídeo fonte (para calcular posição das máscaras).
     """
     canvas_w   = CONFIG["canvas_width"]
     canvas_h   = CONFIG["canvas_height"]
@@ -302,7 +323,7 @@ def construir_filtros(params: dict, com_audio: bool) -> tuple[str, str | None]:
     video_filters = []
 
     # 1. Máscaras primeiro, em coordenadas do vídeo original
-    video_filters.extend(construir_filtros_mascara())
+    video_filters.extend(construir_filtros_mascara(src_w, src_h))
 
     # 2. Transformações
     video_filters += [
@@ -343,9 +364,11 @@ def _montar_comando(
     com_audio: bool,
     crf: int,
     preset: str,
+    src_w: int = 0,
+    src_h: int = 0,
 ) -> list[str]:
     """Monta a linha de comando completa do FFmpeg."""
-    filter_complex, audio_filter = construir_filtros(params, com_audio)
+    filter_complex, audio_filter = construir_filtros(params, com_audio, src_w, src_h)
 
     cmd = [
         "ffmpeg", "-y",
@@ -392,6 +415,8 @@ def renderizar_video(
     params: dict,
     com_audio: bool,
     logger: logging.Logger,
+    src_w: int = 0,
+    src_h: int = 0,
 ) -> tuple[bool, str]:
     """
     Executa FFmpeg. Em caso de falha, tenta uma vez com preset/CRF mais leves.
@@ -404,7 +429,7 @@ def renderizar_video(
     ultimo_erro = ""
 
     for idx, (crf, preset) in enumerate(tentativas):
-        cmd = _montar_comando(input_path, output_path, params, com_audio, crf, preset)
+        cmd = _montar_comando(input_path, output_path, params, com_audio, crf, preset, src_w, src_h)
 
         if idx > 0:
             logger.warning(
@@ -558,7 +583,8 @@ def processar_video(
 
     t_inicio = time.time()
     sucesso, qualidade = renderizar_video(
-        video_path, output_path, params, info["audio"], logger
+        video_path, output_path, params, info["audio"], logger,
+        src_w=info["width"], src_h=info["height"],
     )
     tempo = round(time.time() - t_inicio, 1)
 
@@ -594,4 +620,110 @@ def processar_video(
     return "sucesso" if sucesso else "erro"
 
 
-# ─── MAIN ──────────────────────────────────────────────────
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Clonador de Reels — edição em lote 9:16 (Instagram/TikTok)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Lista vídeos e parâmetros sem renderizar nada",
+    )
+    parser.add_argument(
+        "--reprocess",
+        metavar="ARQUIVO",
+        help="Força reprocessar um arquivo específico ignorando skip_existing",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        metavar="N",
+        help="Quantos vídeos processar em paralelo (sobrescreve o CONFIG)",
+    )
+    args = parser.parse_args()
+
+    logger = setup_logging()
+
+    console.rule("[bold magenta]Clonador de Reels[/bold magenta]")
+    logger.info(f"Sessão iniciada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.dry_run:
+        logger.info("[yellow]DRY-RUN ativo — nenhum vídeo será renderizado[/yellow]")
+
+    videos = validar_ambiente(logger)
+    estado = carregar_estado()
+
+    if args.reprocess:
+        alvo = Path(args.reprocess).name
+        videos = [v for v in videos if v.name == alvo]
+        if not videos:
+            logger.error(f"'{alvo}' não encontrado em /entrada.")
+            sys.exit(1)
+        estado.pop(alvo, None)
+        salvar_estado(estado)
+        logger.info(f"--reprocess: forçando '{alvo}'")
+
+    if args.workers and args.workers > 0:
+        CONFIG["workers"] = args.workers
+    workers = 1 if args.dry_run else resolver_workers()
+
+    if CONFIG.get("watermark_masks"):
+        logger.info(f"Máscara de watermark ativa: {len(CONFIG['watermark_masks'])} região(ões)")
+
+    total = len(videos)
+    contadores = {"sucesso": 0, "pulado": 0, "erro": 0}
+    t_sessao = time.time()
+
+    if workers > 1:
+        logger.info(f"Processando em paralelo com [bold]{workers}[/bold] workers.")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futuros = {
+                pool.submit(
+                    processar_video, video, i, total, estado, logger, args.dry_run
+                ): video
+                for i, video in enumerate(videos, start=1)
+            }
+            for futuro in as_completed(futuros):
+                video = futuros[futuro]
+                try:
+                    contadores[futuro.result()] += 1
+                except Exception as exc:
+                    logger.exception(f"Erro inesperado em {video.name}: {exc}")
+                    contadores["erro"] += 1
+    else:
+        for i, video in enumerate(videos, start=1):
+            try:
+                contadores[processar_video(video, i, total, estado, logger, args.dry_run)] += 1
+            except Exception as exc:
+                logger.exception(f"Erro inesperado em {video.name}: {exc}")
+                contadores["erro"] += 1
+
+    tempo_total = round(time.time() - t_sessao, 1)
+
+    if not args.dry_run:
+        exportar_csv(estado, logger)
+
+    # Resumo final
+    console.rule("[bold]Concluído[/bold]")
+    tabela = Table(show_header=False, box=None, padding=(0, 2))
+    tabela.add_row("[green]Sucesso[/green]",  f"[green]{contadores['sucesso']}[/green]")
+    tabela.add_row("[yellow]Pulados[/yellow]", f"[yellow]{contadores['pulado']}[/yellow]")
+    tabela.add_row("[red]Erros[/red]",         f"[red]{contadores['erro']}[/red]")
+    tabela.add_row("Total",                    str(total))
+    tabela.add_row("Tempo",                    f"{tempo_total}s")
+    if contadores["sucesso"]:
+        media = round(tempo_total / contadores["sucesso"], 1)
+        tabela.add_row("Média/vídeo",          f"{media}s")
+    console.print(tabela)
+
+    logger.info(
+        f"sucesso={contadores['sucesso']} | pulados={contadores['pulado']} | "
+        f"erros={contadores['erro']} | tempo={tempo_total}s"
+    )
+
+    sys.exit(1 if contadores["erro"] else 0)
+
+
+if __name__ == "__main__":
+    main()
