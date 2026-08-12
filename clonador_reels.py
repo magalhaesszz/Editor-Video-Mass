@@ -34,7 +34,7 @@ CONFIG = {
     # Vídeo sobreposto no fundo
     "video_width":  800,
     "position_x":  "center",
-    "position_y":  0.40,
+    "position_y":  0.25,
 
     # Qualidade de exportação
     "output_fps":    30,
