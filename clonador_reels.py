@@ -53,7 +53,7 @@ CONFIG = {
     # ─── CORREÇÃO DE ESPELHAMENTO ─────────────────────────────────────────────
     # True  = corrige vídeos que chegam espelhados (câmera frontal, TikTok etc.)
     # False = não aplica nenhuma correção de espelhamento
-    "fix_mirror": True,
+    "fix_mirror": False,
 
     # ─── Anti-ban ─────────────────────────────────────────────────────────────
     "trim_start":       0.1,
