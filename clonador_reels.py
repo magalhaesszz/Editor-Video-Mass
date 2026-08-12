@@ -66,9 +66,7 @@ CONFIG = {
     # Remove indicadores como "1.8x" gravados no vídeo.
     # x: "center" ou px. y: fração 0-1 ou px. mode: "blur" ou "box"
     # Deixe [] para desativar.
-    "watermark_masks": [
-        {"x": "center", "y": 0.08, "w": 130, "h": 80, "mode": "blur"},
-    ],
+    "watermark_masks": [],
     "mask_box_color": "black",
 
     # Comportamento
